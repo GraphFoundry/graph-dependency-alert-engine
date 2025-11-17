@@ -1,0 +1,93 @@
+package config
+
+import (
+	"errors"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	GraphBaseURL       string
+	GraphTimeout       time.Duration
+	GraphRetries       int
+	CentralityCacheTTL time.Duration
+
+	RiskW1        float64
+	RiskW2        float64
+	RiskW3        float64
+	RiskThreshold float64
+
+	WebhookTargets []string
+	WebhookSecret  []byte
+}
+
+func Load() (Config, error) {
+	var c Config
+
+	c.GraphBaseURL = mustEnv("GRAPH_BASE_URL")
+	c.GraphTimeout = durMs(getEnv("GRAPH_TIMEOUT_MS", "2000"))
+	c.GraphRetries = intEnv("GRAPH_RETRY_MAX", 2)
+	c.CentralityCacheTTL = durMs(getEnv("CENTRALITY_CACHE_TTL_MS", "30000"))
+
+	c.RiskW1 = floatEnv("RISK_W1", 1.0)
+	c.RiskW2 = floatEnv("RISK_W2", 1.0)
+	c.RiskW3 = floatEnv("RISK_W3", 1.0)
+	c.RiskThreshold = floatEnv("RISK_THRESHOLD", 1.2)
+
+	targets := strings.TrimSpace(getEnv("WEBHOOK_TARGET_URLS", ""))
+	if targets != "" {
+		c.WebhookTargets = strings.Split(targets, ",")
+	}
+	c.WebhookSecret = []byte(getEnv("WEBHOOK_SECRET", ""))
+
+	if c.GraphBaseURL == "" {
+		return Config{}, errors.New("GRAPH_BASE_URL required")
+	}
+	return c, nil
+}
+
+func mustEnv(k string) string {
+	return strings.TrimSpace(os.Getenv(k))
+}
+
+func getEnv(k, def string) string {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func intEnv(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return i
+}
+
+func floatEnv(k string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return f
+}
+
+func durMs(v string) time.Duration {
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		i = 2000
+	}
+	return time.Duration(i) * time.Millisecond
+}
