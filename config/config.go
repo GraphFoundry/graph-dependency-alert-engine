@@ -34,7 +34,7 @@ func Load() (Config, error) {
 	c.RiskW1 = floatEnv("RISK_W1", 1.0)
 	c.RiskW2 = floatEnv("RISK_W2", 1.0)
 	c.RiskW3 = floatEnv("RISK_W3", 1.0)
-	c.RiskThreshold = floatEnv("RISK_THRESHOLD", 1.2)
+	c.RiskThreshold = floatEnv("RISK_THRESHOLD", 60.0)
 
 	targets := strings.TrimSpace(getEnv("WEBHOOK_TARGET_URLS", ""))
 	if targets != "" {
