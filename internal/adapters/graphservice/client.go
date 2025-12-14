@@ -53,8 +53,14 @@ var _ ports.GraphProvider = (*Client)(nil)
 
 func (c *Client) GetServices(ctx context.Context) ([]domain.ServiceNode, error) {
 	var out servicesResponse
-	if err := c.getJSON(ctx, "/services", &out); err != nil {
-		return nil, classify(err)
+	if err := c.getJSON(ctx, c.path("/services"), &out); err != nil {
+		if isNotFound(err) {
+			if err := c.getJSON(ctx, c.path("/graph/services"), &out); err != nil {
+				return nil, classify(err)
+			}
+		} else {
+			return nil, classify(err)
+		}
 	}
 	res := make([]domain.ServiceNode, 0, len(out.Services))
 	for _, s := range out.Services {
@@ -79,8 +85,21 @@ func (c *Client) GetCentrality(ctx context.Context) (map[string]domain.Centralit
 	}
 
 	var out centralityResponse
-	if err := c.getJSON(ctx, "/centrality", &out); err != nil {
-		return nil, classify(err)
+	paths := []string{"/centrality", "/graph/centrality", "/graph/centrality/scores"}
+	var lastErr error
+	for _, p := range paths {
+		if err := c.getJSON(ctx, c.path(p), &out); err != nil {
+			lastErr = err
+			if isNotFound(err) {
+				continue
+			}
+			return nil, classify(err)
+		}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		return nil, classify(lastErr)
 	}
 
 	m := make(map[string]domain.Centrality, len(out.Scores))
@@ -101,10 +120,13 @@ func (c *Client) GetCentrality(ctx context.Context) (map[string]domain.Centralit
 			pr = 0
 		}
 		m[svc.ID()] = domain.Centrality{
-			Service:     svc,
-			PageRank:    pr,
-			Betweenness: it.Betweenness,
-			UpdatedAt:   now,
+			Service:          svc,
+			PageRank:         pr,
+			Betweenness:      it.Betweenness,
+			BlastRadius:      it.BlastRadius,
+			DownstreamCount:  it.DownstreamCount,
+			ErrorPropagation: it.ErrorPropagation,
+			UpdatedAt:        now,
 		}
 	}
 
@@ -118,13 +140,45 @@ func (c *Client) GetCentrality(ctx context.Context) (map[string]domain.Centralit
 	return m, nil
 }
 
-func (c *Client) GetPeers(ctx context.Context, svc domain.ServiceNode, direction domain.Direction) ([]domain.ServiceNode, error) {
+func (c *Client) GetHealth(ctx context.Context) (domain.GraphHealth, error) {
+	paths := []string{"/health", "/graph/health"} // try both since deployments may expose either
+	var out healthResponse
+	var lastErr error
+	for _, p := range paths {
+		if err := c.getJSON(ctx, c.path(p), &out); err != nil {
+			lastErr = err
+			if isNotFound(err) {
+				continue // try next path
+			}
+			return domain.GraphHealth{}, classify(err)
+		}
+		return domain.GraphHealth{
+			Status:                out.Status,
+			Stale:                 out.Stale,
+			LastUpdatedSecondsAgo: out.LastUpdatedSecondsAgo,
+			WindowMinutes:         out.WindowMinutes,
+		}, nil
+	}
+	return domain.GraphHealth{}, classify(lastErr)
+}
+
+func (c *Client) GetPeers(ctx context.Context, svc domain.ServiceNode, direction domain.Direction, limit int) ([]domain.ServiceNode, error) {
 	// User requested endpoint pattern: /services/{name}/peers
 	// NOT /services/{namespace}/{name}/peers
-	path := fmt.Sprintf("/services/%s/peers?direction=%s", svc.Name, direction)
+	if limit <= 0 {
+		limit = 10
+	}
+	path := fmt.Sprintf("%s?direction=%s&limit=%d", c.path(fmt.Sprintf("/services/%s/peers", svc.Name)), direction, limit)
 	var out peersResponse
 	if err := c.getJSON(ctx, path, &out); err != nil {
-		return nil, classify(err)
+		if isNotFound(err) {
+			graphPath := fmt.Sprintf("%s?direction=%s&limit=%d", c.path(fmt.Sprintf("/graph/services/%s/peers", svc.Name)), direction, limit)
+			if err := c.getJSON(ctx, graphPath, &out); err != nil {
+				return nil, classify(err)
+			}
+		} else {
+			return nil, classify(err)
+		}
 	}
 	res := make([]domain.ServiceNode, 0, len(out.Peers))
 	for _, p := range out.Peers {
@@ -134,10 +188,32 @@ func (c *Client) GetPeers(ctx context.Context, svc domain.ServiceNode, direction
 	return res, nil
 }
 
+func (c *Client) GetNeighborhood(ctx context.Context, svc domain.ServiceNode, k int) ([]domain.ServiceNode, error) {
+	if k <= 0 {
+		k = 1
+	}
+	path := fmt.Sprintf("%s?k=%d", c.path(fmt.Sprintf("/services/%s/neighborhood", svc.Name)), k)
+	var out neighborhoodResponse
+	if err := c.getJSON(ctx, path, &out); err != nil {
+		if isNotFound(err) {
+			graphPath := fmt.Sprintf("%s?k=%d", c.path(fmt.Sprintf("/graph/services/%s/neighborhood", svc.Name)), k)
+			if err := c.getJSON(ctx, graphPath, &out); err != nil {
+				return nil, classify(err)
+			}
+		} else {
+			return nil, classify(err)
+		}
+	}
+	res := make([]domain.ServiceNode, 0, len(out.Nodes))
+	for _, n := range out.Nodes {
+		name, ns := parseServiceString(n)
+		res = append(res, domain.ServiceNode{Name: name, Namespace: ns})
+	}
+	return res, nil
+}
+
 func parseServiceString(s string) (name, namespace string) {
 	if strings.Contains(s, "/") {
-		// already namespaced? e.g. "prod/payments"
-		// but our curl showed just "frontend".
 		parts := strings.SplitN(s, "/", 2)
 		return parts[1], parts[0]
 	}
@@ -202,4 +278,17 @@ func classify(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w: %v", domain.ErrGraphUnavailable, err)
+}
+
+// path builds a slash-prefixed path relative to the graph-service base URL.
+func (c *Client) path(p string) string {
+	p = strings.TrimPrefix(p, "/")
+	return "/" + p
+}
+
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "404")
 }
