@@ -15,5 +15,11 @@ type Alert struct {
 	Severity    Severity
 	Risk        RiskScore
 	Explanation string
-	CreatedAt   time.Time
+
+	// Actionability
+	RecommendedAction MitigationAction
+	ImpactScope       map[string]int // e.g., "downstream_services": 5
+	AutoMitigatable   bool
+
+	CreatedAt time.Time
 }
