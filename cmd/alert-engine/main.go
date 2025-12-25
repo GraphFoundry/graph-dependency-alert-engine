@@ -12,6 +12,7 @@ import (
 	"graph-alert-engine/internal/core/services"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"time"
@@ -62,8 +63,39 @@ func main() {
 	// Telemetry simulator (replace with K8s informer later)
 	go simulateTelemetry(ctx, bus)
 
+	// K8s Health Checks
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		// Check dependencies? For now just ok.
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ready"))
+	})
+
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	go func() {
+		logger.Info("starting health check server", "addr", ":8080")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("health server failed", "error", err)
+		}
+	}()
+
 	logger.Info("alert-engine started", "webhook_targets", len(cfg.WebhookTargets))
 	<-ctx.Done()
+
+	ctxShutdown, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	if err := srv.Shutdown(ctxShutdown); err != nil {
+		logger.Error("server shutdown failed", "error", err)
+	}
+
 	logger.Info("shutdown")
 }
 
@@ -88,10 +120,14 @@ func simulateTelemetry(ctx context.Context, bus ports.EventBus) {
 				errRate += 0.2
 			}
 			_ = bus.Publish(ctx, domain.TopicTelemetryUpdated, domain.Telemetry{
-				Service:      svc,
-				LatencyP95Ms: lat,
-				ErrorRate:    errRate,
-				Timestamp:    now,
+				Service:       svc,
+				LatencyP95Ms:  lat,
+				LatencyP99Ms:  lat * 1.5,
+				ErrorRate:     errRate,
+				ErrorRate1m:   errRate,       // simplified, assume bursty
+				ErrorRate5m:   errRate * 0.8, // simplified smoothing
+				ThroughputRPS: 50.0 + r.Float64()*100,
+				Timestamp:     now,
 			})
 		}
 	}
