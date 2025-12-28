@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graph-alert-engine
+  labels:
+    app: graph-alert-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graph-alert-engine
+  template:
+    metadata:
+      labels:
+        app: graph-alert-engine
+    spec:
+      containers:
+        - name: alert-engine
+          image: graph-alert-engine:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: GRAPH_BASE_URL
+              value: "http://graph-service:80"
+            - name: RISK_THRESHOLD
+              value: "80.0"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            # httpHeaders: []
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
