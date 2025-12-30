@@ -27,9 +27,12 @@ type RiskService struct {
 	weights   Weights
 	threshold float64
 
-	mu                  sync.Mutex
-	history             map[string][]domain.Telemetry // key = ServiceNode.ID()
-	scoreHistory        map[string][]scoreRecord      // Internal struct for rolling avg
+	mu             sync.Mutex
+	history        map[string][]domain.Telemetry // key = ServiceNode.ID()
+	scoreHistory   map[string][]scoreRecord      // Internal struct for rolling avg
+	recentAlerts   []domain.Alert
+	lastRiskScores map[string]domain.RiskScore // Cache latest risk score per service
+
 	cooldowns           map[string]time.Time
 	consecutiveBreaches map[string]int
 	healthyStreak       map[string]int
@@ -67,6 +70,8 @@ func NewRiskService(logger *slog.Logger, bus ports.EventBus, graph ports.GraphPr
 		threshold:           threshold,
 		history:             make(map[string][]domain.Telemetry),
 		scoreHistory:        make(map[string][]scoreRecord),
+		recentAlerts:        make([]domain.Alert, 0),
+		lastRiskScores:      make(map[string]domain.RiskScore),
 		cooldowns:           make(map[string]time.Time),
 		consecutiveBreaches: make(map[string]int),
 		healthyStreak:       make(map[string]int),
@@ -85,6 +90,34 @@ func NewRiskService(logger *slog.Logger, bus ports.EventBus, graph ports.GraphPr
 		livenessTimeout:     45 * time.Second,
 		recoverySamples:     3,
 	}
+}
+
+// Public Accessors for API
+
+func (r *RiskService) GetRecentAlerts() []domain.Alert {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Return copy
+	out := make([]domain.Alert, len(r.recentAlerts))
+	copy(out, r.recentAlerts)
+	return out
+}
+
+func (r *RiskService) GetRiskProfile(serviceID string) (domain.RiskScore, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rs, ok := r.lastRiskScores[serviceID]
+	return rs, ok
+}
+
+func (r *RiskService) GetAllServicesRisk() []domain.RiskScore {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]domain.RiskScore, 0, len(r.lastRiskScores))
+	for _, rs := range r.lastRiskScores {
+		out = append(out, rs)
+	}
+	return out
 }
 
 func (r *RiskService) Start(ctx context.Context) (stop func()) {
@@ -143,18 +176,24 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 	r.mu.Unlock()
 
 	// 1. Get Graph Signals
-	health, err := r.graph.GetHealth(ctx)
-	if err != nil {
+	var health domain.GraphHealth
+	if h, err := r.graph.GetHealth(ctx); err == nil {
+		health = h
+	} else {
 		r.logger.Warn("graph health fetch failed; treating as stale", "error", err)
 		health = domain.GraphHealth{Stale: true}
 	}
 
 	centralityMap, err := r.graph.GetCentrality(ctx)
+	// If centrality fails, we can proceed with defaults, but log it.
 	if err != nil {
-		return fmt.Errorf("getting centrality: %w", err)
+		r.logger.Warn("getting centrality failed", "error", err)
+		centralityMap = make(map[string]domain.Centrality)
 	}
+
 	c, ok := centralityMap[svcID]
 	if !ok {
+		// Try fallback lookups
 		if alt, ok := centralityMap[t.Service.Name]; ok {
 			c = alt
 		} else if alt, ok := centralityMap["default/"+t.Service.Name]; ok {
@@ -162,24 +201,45 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 		}
 	}
 	if !ok {
-		// Default to low centrality but nonzero to avoid divide-by-zero issues in some models
+		// Default to low centrality
 		c = domain.Centrality{Service: t.Service, PageRank: 0.001}
 	}
 
-	upPeers, err := r.graph.GetPeers(ctx, t.Service, domain.DirectionIn, 15)
-	if err != nil {
-		r.logger.Warn("failed to fetch upstream peers", "service", svcID, "error", err)
+	// Strictly verify service existence in known roster before querying detailed graph (peers/neighborhood).
+	// This ensures we follow the API "Chain": List Services -> Get Details.
+	// We check r.knownServices (or by name) which is populated by refreshServiceRoster loop.
+	r.mu.Lock()
+	_, knownID := r.knownServices[svcID]
+	_, knownName := r.knownByName[t.Service.Name]
+	r.mu.Unlock()
+
+	var upPeers, downPeers []domain.ServiceNode
+	var neighborhoodSize int
+
+	if knownID || knownName {
+		// Service is confirmed in list, safe to query details
+		if up, err := r.graph.GetPeers(ctx, t.Service, domain.DirectionIn, 15); err == nil {
+			upPeers = up
+		} else {
+			r.logger.Warn("failed to fetch upstream peers", "service", svcID, "error", err)
+		}
+
+		if down, err := r.graph.GetPeers(ctx, t.Service, domain.DirectionOut, 15); err == nil {
+			downPeers = down
+		} else {
+			r.logger.Warn("failed to fetch downstream peers", "service", svcID, "error", err)
+		}
+	} else {
+		// Unknown service - skip graph details to prevent 404 floods or invalid queries
+		r.logger.Debug("skipping graph details for unknown service", "service", svcID)
 	}
-	downPeers, err := r.graph.GetPeers(ctx, t.Service, domain.DirectionOut, 15)
-	if err != nil {
-		r.logger.Warn("failed to fetch downstream peers", "service", svcID, "error", err)
-	}
+
 	upCount := len(upPeers)
 	downCount := len(downPeers)
 
-	neighborhoodSize := 0
-	// Only ask for neighborhood when the service is structurally important to avoid hammering graph service
-	if c.PageRank >= 0.2 || downCount >= 5 || c.DownstreamCount >= 5 {
+	neighborhoodSize = 0
+	// Only ask for neighborhood when the service is structurally important to avoid hammering graph service (and only if confirmed known)
+	if (knownID || knownName) && (c.PageRank >= 0.2 || downCount >= 5 || c.DownstreamCount >= 5) {
 		if neigh, err := r.graph.GetNeighborhood(ctx, t.Service, 2); err == nil {
 			neighborhoodSize = len(neigh)
 		} else {
@@ -206,17 +266,33 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 		errScore = 100
 	}
 
-	// Graph: Composite Centrality Score informed by peers
+	// Graph: Composite Centrality Score
+	// Formula: Risk = PageRank*0.6 + Betweenness*0.3 + PeerRisk*0.1
+	// Peer Risk = downstream * ln(upstream + 1)
 	peerRisk := float64(downCount) * math.Log(float64(upCount)+1)
-	peerNormalized := clamp01(peerRisk / 10) // rough normalization, capped at 1
 
-	blast := clamp01(c.BlastRadius / 100)
-	graphComposite := clamp01((c.PageRank * 0.4) + (c.Betweenness * 0.3) + (blast * 0.2) + (peerNormalized * 0.1))
+	// Normalize PeerRisk roughly to 0-1 range for the formula mixing.
+	// Assuming max reasonable peer interaction is e.g. 10 downstream, 10 upstream.
+	// 10 * ln(11) =~ 24.  24 * 0.1 = 2.4. This creates a strong signal.
+	// We'll clamp the component to avoid it overwhelming PR/Betweenness completely if strictly 0-1 is needed,
+	// but the formula implies direct linear combination. We will clamp the *result* to ensure 0-1.
+
+	// Using the provided weights:
+	term1 := c.PageRank * 0.6
+	term2 := c.Betweenness * 0.3
+	term3 := peerRisk * 0.1
+
+	// Define peerNormalized for visibility in RiskComponents later
+	peerNormalized := clamp01(term3)
+
+	graphComposite := clamp01(term1 + term2 + term3)
 	graphImpact := graphComposite * 100
 
-	// Neighborhood amplification for cascade potential
+	// Neighborhood amplification (Bonus risk, not part of the base weighted formula but originally requested)
 	if neighborhoodSize > 0 {
-		graphImpact += math.Min(float64(neighborhoodSize), 20)
+		// Cap bonus to 20 points
+		bonus := math.Min(float64(neighborhoodSize), 20.0)
+		graphImpact += bonus
 	}
 
 	// Apply freshness penalty if graph is stale
@@ -243,13 +319,12 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 	sHist := r.scoreHistory[svcID]
 
 	avg30s := r.calculateRollingAverage(sHist, 30*time.Second)
-	avg2m := r.calculateRollingAverage(sHist, 2*time.Minute)
+	avg2m := r.calculateRollingAverage(sHist, 2*time.Second)
 
 	delta1s := 0.0
 	if len(sHist) >= 2 {
 		delta1s = sHist[len(sHist)-1].Score - sHist[len(sHist)-2].Score
 	}
-	r.mu.Unlock()
 
 	// 5. Construct Risk Object
 	rs := domain.RiskScore{
@@ -291,6 +366,11 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 	// Determine Severity
 	rs.Severity = severityFrom(rawScore, r.threshold)
 
+	// Store latest risk score
+	r.lastRiskScores[svcID] = rs
+
+	r.mu.Unlock()
+
 	// Publish Score
 	if err := r.bus.Publish(ctx, domain.TopicRiskScoreComputed, rs); err != nil {
 		r.logger.Error("failed to publish risk score", "error", err)
@@ -314,7 +394,7 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 	if r.consecutiveBreaches[svcID] >= 3 {
 		// Check cooldown
 		if lastAlert, ok := r.cooldowns[svcID]; ok {
-			if time.Since(lastAlert) < 5*time.Minute {
+			if time.Since(lastAlert) < 5*time.Second {
 				return nil // Suppressed
 			}
 		}
@@ -328,6 +408,10 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 		} else if errScore > 80 {
 			action = domain.ActionFailover
 			auto = false // Failover might be risky to auto-trigger without redundancy check
+		} else if graphImpact > 80 {
+			// High graph risk (e.g. key node)
+			action = domain.ActionObserve // Can't easily auto-fix centrality
+			auto = false
 		}
 
 		if health.Stale {
@@ -351,6 +435,12 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 				"neighborhood":     neighborhoodSize,
 			},
 			AutoMitigatable: auto,
+		}
+
+		// Store alert
+		r.recentAlerts = append(r.recentAlerts, alert)
+		if len(r.recentAlerts) > 50 { // Keep only the 50 most recent alerts
+			r.recentAlerts = r.recentAlerts[len(r.recentAlerts)-50:]
 		}
 
 		if err := r.bus.Publish(ctx, domain.TopicRiskAlertRaised, alert); err != nil {
