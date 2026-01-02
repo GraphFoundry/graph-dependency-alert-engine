@@ -6,6 +6,7 @@ import (
 	"graph-alert-engine/internal/adapters/eventbus"
 	"graph-alert-engine/internal/adapters/forecasting"
 	"graph-alert-engine/internal/adapters/graphservice"
+	api "graph-alert-engine/internal/adapters/http"
 	"graph-alert-engine/internal/adapters/webhooks"
 	"graph-alert-engine/internal/core/domain"
 	"graph-alert-engine/internal/core/ports"
@@ -37,7 +38,12 @@ func main() {
 	bus := eventbus.New()
 
 	cb := graphservice.NewCircuitBreaker(3, 5*time.Second)
-	graph := graphservice.New(cfg.GraphBaseURL, cfg.GraphTimeout, cfg.GraphRetries, cb, cfg.CentralityCacheTTL)
+	graphClient := graphservice.New(cfg.GraphBaseURL, cfg.GraphTimeout, cfg.GraphRetries, cb, cfg.CentralityCacheTTL)
+
+	// Wrap in Poller
+	graphPoller := graphservice.NewGraphPoller(logger, graphClient, 5*time.Second)
+	stopPoller := graphPoller.Start(ctx)
+	defer stopPoller()
 
 	forecaster := forecasting.New()
 
@@ -46,7 +52,7 @@ func main() {
 	rs := services.NewRiskService(
 		logger,
 		bus,
-		graph,
+		graphPoller, // Use Poller as Provider
 		forecaster,
 		clock,
 		services.Weights{W1PageRank: cfg.RiskW1, W2Latency: cfg.RiskW2, W3Error: cfg.RiskW3},
@@ -63,7 +69,10 @@ func main() {
 	// Telemetry simulator (replace with K8s informer later)
 	go simulateTelemetry(ctx, bus)
 
-	// K8s Health Checks
+	// API Handler
+	apiHandler := api.NewHandler(rs, graphPoller)
+
+	// K8s Health Checks & API
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -75,15 +84,18 @@ func main() {
 		w.Write([]byte("ready"))
 	})
 
+	// Register API Routes
+	apiHandler.RegisterRoutes(mux)
+
 	srv := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":8002",
 		Handler: mux,
 	}
 
 	go func() {
-		logger.Info("starting health check server", "addr", ":8080")
+		logger.Info("starting server", "addr", ":8002")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("health server failed", "error", err)
+			logger.Error("server failed", "error", err)
 		}
 	}()
 
@@ -111,22 +123,23 @@ func simulateTelemetry(ctx context.Context, bus ports.EventBus) {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			lat := 120.0 + r.Float64()*400.0
-			if r.Float64() < 0.15 {
-				lat *= 3 // spike
+			// Healthy by default
+			lat := 20.0 + r.Float64()*10.0 // 20-30ms latency
+			if r.Float64() < 0.01 {        // 1% chance of spike
+				lat *= 5 // ~100-150ms (still not critical)
 			}
-			errRate := r.Float64() * 0.05
-			if r.Float64() < 0.1 {
-				errRate += 0.2
+			errRate := 0.0
+			if r.Float64() < 0.005 { // 0.5% chance of error burst
+				errRate = 0.01 // 1% error rate
 			}
 			_ = bus.Publish(ctx, domain.TopicTelemetryUpdated, domain.Telemetry{
 				Service:       svc,
 				LatencyP95Ms:  lat,
 				LatencyP99Ms:  lat * 1.5,
 				ErrorRate:     errRate,
-				ErrorRate1m:   errRate,       // simplified, assume bursty
-				ErrorRate5m:   errRate * 0.8, // simplified smoothing
-				ThroughputRPS: 50.0 + r.Float64()*100,
+				ErrorRate1m:   errRate,
+				ErrorRate5m:   errRate,
+				ThroughputRPS: 50.0 + r.Float64()*10,
 				Timestamp:     now,
 			})
 		}
