@@ -454,6 +454,8 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 			}
 		}
 
+		reasonCodes := determineRiskReasonCodes(latScore, errScore, graphImpact, health)
+
 		alert := domain.Alert{
 			Service:           t.Service,
 			Severity:          rs.Severity,
@@ -468,6 +470,9 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 			},
 			AutoMitigatable: auto,
 		}
+
+		// Enrich alert with decision-first fields
+		alert = enrichAlert(alert, domain.AlertTypeAvailabilityDegraded, reasonCodes)
 
 		// Store alert
 		r.recentAlerts = append(r.recentAlerts, alert)
@@ -700,6 +705,8 @@ func (r *RiskService) raiseAvailabilityAlert(ctx context.Context, svc domain.Ser
 		downstreamCount = len(peers)
 	}
 
+	reasonCodes := determineAvailabilityReasonCodes(podCount, availability)
+
 	alert := domain.Alert{
 		Service:           svc,
 		Severity:          severity,
@@ -722,9 +729,13 @@ func (r *RiskService) raiseAvailabilityAlert(ctx context.Context, svc domain.Ser
 			Meta: domain.RiskMetadata{
 				ModelVersion:     "v2.0-hybrid",
 				ThresholdVersion: "2026-01-02",
+				CalculationID:    fmt.Sprintf("avail-%s", svcID), // Ensure always set
 			},
 		},
 	}
+
+	// Enrich alert with decision-first fields
+	alert = enrichAlert(alert, domain.AlertTypeAvailabilityDegraded, reasonCodes)
 
 	if err := r.bus.Publish(ctx, domain.TopicRiskAlertRaised, alert); err != nil {
 		r.logger.Error("failed to publish availability alert", "error", err, "service", svcID)
@@ -767,9 +778,14 @@ func (r *RiskService) raiseRestorationAlert(ctx context.Context, svc domain.Serv
 			Meta: domain.RiskMetadata{
 				ModelVersion:     "v2.0-hybrid",
 				ThresholdVersion: "2026-01-02",
+				CalculationID:    fmt.Sprintf("restore-%d", now.Unix()),
 			},
 		},
 	}
+
+	// Enrich with decision-first fields, mark as resolved
+	alert = enrichAlert(alert, domain.AlertTypeAvailabilityDegraded, []string{"RESTORED"})
+	alert.State = domain.AlertStateResolved
 
 	if err := r.bus.Publish(ctx, domain.TopicRiskAlertRaised, alert); err != nil {
 		r.logger.Error("failed to publish restoration alert", "error", err, "service", svcID)
@@ -834,9 +850,13 @@ func (r *RiskService) raiseSilentAlert(ctx context.Context, svc domain.ServiceNo
 			Meta: domain.RiskMetadata{
 				ModelVersion:     "v2.0-hybrid",
 				ThresholdVersion: "2026-01-02",
+				CalculationID:    fmt.Sprintf("silent-%d", now.Unix()),
 			},
 		},
 	}
+
+	// Enrich with decision-first fields
+	alert = enrichAlert(alert, domain.AlertTypeSingleReplica, []string{"TELEMETRY_SILENT"})
 
 	if err := r.bus.Publish(ctx, domain.TopicRiskAlertRaised, alert); err != nil {
 		r.logger.Error("failed to publish silent-service alert", "error", err, "service", svc.ID())

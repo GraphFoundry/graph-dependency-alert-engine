@@ -32,12 +32,14 @@ func (o *Outbound) Start(ctx context.Context) (stop func()) {
 		if !ok {
 			return
 		}
-		_ = o.dispatch(hctx, alert)
+		// Transform to decision-first webhook payload
+		event := TransformAlertToEvent(alert)
+		_ = o.dispatch(hctx, event)
 	})
 }
 
-func (o *Outbound) dispatch(ctx context.Context, alert domain.Alert) error {
-	body, err := json.Marshal(alert)
+func (o *Outbound) dispatch(ctx context.Context, event AlertEvent) error {
+	body, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
