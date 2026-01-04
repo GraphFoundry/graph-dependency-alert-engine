@@ -67,7 +67,7 @@ func (c *Client) GetServices(ctx context.Context) ([]domain.ServiceNode, error) 
 		res = append(res, domain.ServiceNode{
 			Name:         s.Name,
 			Namespace:    s.Namespace,
-			PodCount:     s.PodCount,
+			PodCount:     int(s.PodCount),
 			Availability: s.Availability,
 		})
 	}
