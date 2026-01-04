@@ -5,8 +5,10 @@ import (
 )
 
 type ServiceNode struct {
-	Name      string
-	Namespace string
+	Name         string
+	Namespace    string
+	PodCount     int
+	Availability float64
 }
 
 func (s ServiceNode) ID() string {
