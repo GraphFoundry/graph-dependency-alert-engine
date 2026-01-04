@@ -14,4 +14,5 @@ const (
 	ActionDegrade  MitigationAction = "degrade"
 	ActionFailover MitigationAction = "failover"
 	ActionObserve  MitigationAction = "observe"
+	ActionScaleUp  MitigationAction = "scale_up"
 )

@@ -43,6 +43,8 @@ type RiskService struct {
 	offlineActive   map[string]bool
 	offlineCooldown map[string]time.Time
 	recoveryTracker map[string]int
+	availabilityDegraded     map[string]bool
+	availabilityDegradedTime map[string]time.Time
 	seenByName      map[string]bool
 	lastSeenByName  map[string]time.Time
 	knownByName     map[string]domain.ServiceNode
@@ -78,10 +80,12 @@ func NewRiskService(logger *slog.Logger, bus ports.EventBus, graph ports.GraphPr
 		knownServices:       make(map[string]domain.ServiceNode),
 		seenTelemetry:       make(map[string]bool),
 		lastSeen:            make(map[string]time.Time),
-		offlineActive:       make(map[string]bool),
-		offlineCooldown:     make(map[string]time.Time),
-		recoveryTracker:     make(map[string]int),
-		seenByName:          make(map[string]bool),
+		offlineActive:            make(map[string]bool),
+		offlineCooldown:          make(map[string]time.Time),
+		recoveryTracker:          make(map[string]int),
+		availabilityDegraded:     make(map[string]bool),
+		availabilityDegradedTime: make(map[string]time.Time),
+		seenByName:               make(map[string]bool),
 		lastSeenByName:      make(map[string]time.Time),
 		knownByName:         make(map[string]domain.ServiceNode),
 		allowedNS:           map[string]struct{}{"default": {}},
@@ -202,7 +206,12 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 	}
 	if !ok {
 		// Default to low centrality
-		c = domain.Centrality{Service: t.Service, PageRank: 0.001}
+		c = domain.Centrality{
+			Service:      t.Service,
+			PageRank:     0.001,
+			PodCount:     -1, // -1 indicates no data available
+			Availability: -1, // -1 indicates no data available
+		}
 	}
 
 	// Strictly verify service existence in known roster before querying detailed graph (peers/neighborhood).
@@ -302,6 +311,29 @@ func (r *RiskService) handleTelemetry(ctx context.Context, t domain.Telemetry) e
 
 	// Weighted Sum
 	rawScore := (latScore * r.weights.W2Latency) + (errScore * r.weights.W3Error) + (graphImpact * r.weights.W1PageRank)
+
+	// Factor in availability - if availability is low, increase risk score
+	// Only apply penalty if we have valid availability data (>= 0)
+	availabilityPenalty := 0.0
+	if c.Availability >= 0 && c.Availability < 0.8 {
+		// Add penalty based on how low availability is
+		// 80% availability = 0 penalty, 0% availability = 30 points penalty
+		availabilityPenalty = (0.8 - c.Availability) * 37.5 // (0.8-0) * 37.5 = 30
+	}
+
+	// Factor in pod count - if pods are 0, this is critical
+	// Only apply penalty if we have valid pod count data (>= 0)
+	podCountPenalty := 0.0
+	if c.PodCount >= 0 {
+		if c.PodCount == 0 {
+			podCountPenalty = 50.0 // Major penalty for no pods
+		} else if c.PodCount == 1 {
+			podCountPenalty = 15.0 // Moderate penalty for single pod (no redundancy)
+		}
+	}
+
+	rawScore += availabilityPenalty + podCountPenalty
+
 	// Cap at 100
 	if rawScore > 100 {
 		rawScore = 100
@@ -561,6 +593,9 @@ func (r *RiskService) checkSilentServices(ctx context.Context) {
 	}
 	r.mu.Unlock()
 
+	// Check availability for all services
+	r.checkServiceAvailability(ctx)
+
 	for id, svc := range snapshot {
 		ts := lastSeen[id]
 		svcSeen := seen[id]
@@ -580,6 +615,182 @@ func (r *RiskService) checkSilentServices(ctx context.Context) {
 		}
 		r.raiseSilentAlert(ctx, svc, ts, now)
 	}
+}
+
+// checkServiceAvailability monitors service availability and podCount, generating alerts for down or degraded services
+func (r *RiskService) checkServiceAvailability(ctx context.Context) {
+	// Get latest services data which includes availability and podCount
+	services, err := r.graph.GetServices(ctx)
+	if err != nil {
+		r.logger.Debug("failed to fetch services for availability check", "error", err)
+		return
+	}
+
+	now := r.clock.Now()
+
+	for _, svc := range services {
+		svcID := svc.ID()
+		podCount := svc.PodCount
+		availability := svc.Availability
+
+		// Check if service is down (no pods running)
+		if podCount == 0 {
+			r.raiseAvailabilityAlert(ctx, svc, "service has 0 pods running", domain.SeverityCritical, podCount, availability, now)
+			continue
+		}
+
+		// Check if service availability is critically low (below 50%)
+		if availability < 0.5 {
+			r.raiseAvailabilityAlert(ctx, svc, fmt.Sprintf("service availability critically low: %.1f%%", availability*100), domain.SeverityCritical, podCount, availability, now)
+			continue
+		}
+
+		// Check if service availability is degraded (below 80%)
+		if availability < 0.8 {
+			r.raiseAvailabilityAlert(ctx, svc, fmt.Sprintf("service availability degraded: %.1f%%", availability*100), domain.SeverityWarning, podCount, availability, now)
+			continue
+		}
+
+		// Service is healthy - check if it was previously degraded and raise restoration alert
+		r.mu.Lock()
+		wasDegraded := r.availabilityDegraded[svcID]
+		degradedTime := r.availabilityDegradedTime[svcID]
+		delete(r.offlineActive, svcID)
+		delete(r.availabilityDegraded, svcID)
+		delete(r.availabilityDegradedTime, svcID)
+		r.mu.Unlock()
+
+		if wasDegraded {
+			r.raiseRestorationAlert(ctx, svc, podCount, availability, degradedTime, now)
+		}
+	}
+}
+
+// raiseAvailabilityAlert creates an alert for service availability issues
+func (r *RiskService) raiseAvailabilityAlert(ctx context.Context, svc domain.ServiceNode, reason string, severity domain.Severity, podCount int, availability float64, now time.Time) {
+	svcID := svc.ID()
+
+	r.mu.Lock()
+	// Check if we already have an active alert for this service
+	if r.offlineActive[svcID] {
+		r.mu.Unlock()
+		return
+	}
+
+	// Check cooldown
+	if lastAlert, ok := r.offlineCooldown[svcID]; ok {
+		if now.Sub(lastAlert) < 30*time.Second {
+			r.mu.Unlock()
+			return
+		}
+	}
+
+	r.offlineActive[svcID] = true
+	r.offlineCooldown[svcID] = now
+	// Only set degraded time when first detecting the issue
+	if !r.availabilityDegraded[svcID] {
+		r.availabilityDegradedTime[svcID] = now
+	}
+	r.availabilityDegraded[svcID] = true
+	r.mu.Unlock()
+
+	// Get downstream impact
+	downstreamCount := 0
+	if peers, err := r.graph.GetPeers(ctx, svc, domain.DirectionOut, 15); err == nil {
+		downstreamCount = len(peers)
+	}
+
+	alert := domain.Alert{
+		Service:           svc,
+		Severity:          severity,
+		RecommendedAction: domain.ActionScaleUp,
+		ImpactScope: map[string]int{
+			"downstream_count": downstreamCount,
+			"pod_count":        podCount,
+		},
+		AutoMitigatable: podCount == 0, // Auto-mitigatable if completely down
+		CreatedAt:       now,
+		Explanation:     fmt.Sprintf("%s (pods: %d, availability: %.1f%%)", reason, podCount, availability*100),
+		Risk: domain.RiskScore{
+			Service:   svc,
+			Score:     calculateAvailabilityScore(podCount, availability),
+			Severity:  severity,
+			Timestamp: now,
+			Metrics: domain.RiskMetrics{
+				PageRank: 0, // Will be filled from centrality if available
+			},
+			Meta: domain.RiskMetadata{
+				ModelVersion:     "v2.0-hybrid",
+				ThresholdVersion: "2026-01-02",
+			},
+		},
+	}
+
+	if err := r.bus.Publish(ctx, domain.TopicRiskAlertRaised, alert); err != nil {
+		r.logger.Error("failed to publish availability alert", "error", err, "service", svcID)
+		return
+	}
+
+	r.logger.Warn("service availability issue detected", "service", svcID, "reason", reason, "pods", podCount, "availability", availability)
+}
+
+// raiseRestorationAlert creates an alert when a service is restored to healthy state
+func (r *RiskService) raiseRestorationAlert(ctx context.Context, svc domain.ServiceNode, podCount int, availability float64, degradedSince time.Time, now time.Time) {
+	svcID := svc.ID()
+	duration := now.Sub(degradedSince)
+
+	// Get downstream impact
+	downstreamCount := 0
+	if peers, err := r.graph.GetPeers(ctx, svc, domain.DirectionOut, 15); err == nil {
+		downstreamCount = len(peers)
+	}
+
+	alert := domain.Alert{
+		Service:           svc,
+		Severity:          domain.SeverityInfo,
+		RecommendedAction: domain.ActionObserve,
+		ImpactScope: map[string]int{
+			"downstream_count": downstreamCount,
+			"pod_count":        podCount,
+		},
+		AutoMitigatable: false,
+		CreatedAt:       now,
+		Explanation:     fmt.Sprintf("service restored to healthy state (pods: %d, availability: %.1f%%, downtime: %s)", podCount, availability*100, duration.Round(time.Second)),
+		Risk: domain.RiskScore{
+			Service:   svc,
+			Score:     0,
+			Severity:  domain.SeverityInfo,
+			Timestamp: now,
+			Metrics: domain.RiskMetrics{
+				PageRank: 0,
+			},
+			Meta: domain.RiskMetadata{
+				ModelVersion:     "v2.0-hybrid",
+				ThresholdVersion: "2026-01-02",
+			},
+		},
+	}
+
+	if err := r.bus.Publish(ctx, domain.TopicRiskAlertRaised, alert); err != nil {
+		r.logger.Error("failed to publish restoration alert", "error", err, "service", svcID)
+		return
+	}
+
+	r.logger.Info("service restored to healthy state", "service", svcID, "pods", podCount, "availability", availability, "downtime", duration.Round(time.Second))
+}
+
+// calculateAvailabilityScore returns a risk score based on pod count and availability
+func calculateAvailabilityScore(podCount int, availability float64) float64 {
+	if podCount == 0 {
+		return 100.0 // Critical - service completely down
+	}
+	if availability < 0.5 {
+		return 90.0 // Critical - less than 50% availability
+	}
+	if availability < 0.8 {
+		return 70.0 // Warning - degraded availability
+	}
+	return 30.0 // Low risk
 }
 
 func (r *RiskService) raiseSilentAlert(ctx context.Context, svc domain.ServiceNode, last time.Time, now time.Time) {

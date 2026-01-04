@@ -13,8 +13,10 @@ type healthResponse struct {
 }
 
 type serviceDTO struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
+	Name         string  `json:"name"`
+	Namespace    string  `json:"namespace"`
+	PodCount     int     `json:"podCount"`
+	Availability float64 `json:"availability"`
 }
 
 type centralityResponse struct {
@@ -28,6 +30,8 @@ type centralityScoreDTO struct {
 	BlastRadius      float64 `json:"blast_radius"`
 	DownstreamCount  int     `json:"downstream_count"`
 	ErrorPropagation float64 `json:"error_propagation"`
+	PodCount         int     `json:"podCount"`
+	Availability     float64 `json:"availability"`
 }
 
 type peersResponse struct {
