@@ -21,6 +21,11 @@ type Config struct {
 
 	WebhookTargets []string
 	WebhookSecret  []byte
+
+	// Optional: Service catalog enrichment for webhooks
+	ClusterName string // CLUSTER_NAME
+	Region      string // REGION
+	Environment string // ENVIRONMENT (prod/stage/dev)
 }
 
 func Load() (Config, error) {
@@ -41,6 +46,11 @@ func Load() (Config, error) {
 		c.WebhookTargets = strings.Split(targets, ",")
 	}
 	c.WebhookSecret = []byte(getEnv("WEBHOOK_SECRET", ""))
+
+	// Optional enrichment fields for webhooks
+	c.ClusterName = getEnv("CLUSTER_NAME", "")
+	c.Region = getEnv("REGION", "")
+	c.Environment = getEnv("ENVIRONMENT", "")
 
 	if c.GraphBaseURL == "" {
 		return Config{}, errors.New("GRAPH_BASE_URL required")
