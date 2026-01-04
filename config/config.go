@@ -48,9 +48,9 @@ func Load() (Config, error) {
 	c.WebhookSecret = []byte(getEnv("WEBHOOK_SECRET", ""))
 
 	// Optional enrichment fields for webhooks
-	c.ClusterName = getEnv("CLUSTER_NAME", "")
-	c.Region = getEnv("REGION", "")
-	c.Environment = getEnv("ENVIRONMENT", "")
+	c.ClusterName = getEnv("CLUSTER_NAME", "LIONS-DEN")
+	c.Region = getEnv("REGION", "LK")
+	c.Environment = getEnv("ENVIRONMENT", "DEBUG")
 
 	if c.GraphBaseURL == "" {
 		return Config{}, errors.New("GRAPH_BASE_URL required")

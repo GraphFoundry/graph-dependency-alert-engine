@@ -70,7 +70,7 @@ func main() {
 	go simulateTelemetry(ctx, bus)
 
 	// API Handler
-	apiHandler := api.NewHandler(rs, graphPoller)
+	apiHandler := api.NewHandler(rs, graphPoller, nil)
 
 	// K8s Health Checks & API
 	mux := http.NewServeMux()

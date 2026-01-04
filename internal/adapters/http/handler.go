@@ -13,7 +13,7 @@ type Handler struct {
 	poller      *graphservice.GraphPoller
 }
 
-func NewHandler(rs *services.RiskService, gp *graphservice.GraphPoller) *Handler {
+func NewHandler(rs *services.RiskService, gp *graphservice.GraphPoller, _ interface{}) *Handler {
 	return &Handler{
 		riskService: rs,
 		poller:      gp,
