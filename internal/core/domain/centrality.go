@@ -9,6 +9,8 @@ type Centrality struct {
 	BlastRadius      float64 // normalized score 0-100 indicating downstream impact
 	DownstreamCount  int
 	ErrorPropagation float64 // likelihood of propagating errors 0-1
+	PodCount         int
+	Availability     float64
 	UpdatedAt        time.Time
 }
 

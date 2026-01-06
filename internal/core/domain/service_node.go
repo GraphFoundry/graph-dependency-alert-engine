@@ -5,8 +5,14 @@ import (
 )
 
 type ServiceNode struct {
-	Name      string
-	Namespace string
+	Name         string
+	Namespace    string
+	PodCount     int
+	Availability float64
+
+	// SLO context (optional, for meaningful threshold interpretation)
+	SLOTarget *float64 // e.g., 0.9900
+	SLOWindow *string  // e.g., "5m", "1h"
 }
 
 func (s ServiceNode) ID() string {

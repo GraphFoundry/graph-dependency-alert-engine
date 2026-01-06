@@ -64,7 +64,12 @@ func (c *Client) GetServices(ctx context.Context) ([]domain.ServiceNode, error) 
 	}
 	res := make([]domain.ServiceNode, 0, len(out.Services))
 	for _, s := range out.Services {
-		res = append(res, domain.ServiceNode{Name: s.Name, Namespace: s.Namespace})
+		res = append(res, domain.ServiceNode{
+			Name:         s.Name,
+			Namespace:    s.Namespace,
+			PodCount:     int(s.PodCount),
+			Availability: s.Availability,
+		})
 	}
 	return res, nil
 }
@@ -112,7 +117,12 @@ func (c *Client) GetCentrality(ctx context.Context) (map[string]domain.Centralit
 		// But domain.ServiceNode splits it.
 		// Let's assume "default" for now if just a name, or parse it if it looks like "ns/name".
 		name, ns := parseServiceString(it.Service)
-		svc := domain.ServiceNode{Name: name, Namespace: ns}
+		svc := domain.ServiceNode{
+			Name:         name,
+			Namespace:    ns,
+			PodCount:     it.PodCount,
+			Availability: it.Availability,
+		}
 
 		// If API returns unbounded pagerank, normalize in adapter (do NOT leak weirdness into core).
 		pr := it.PageRank
@@ -126,6 +136,8 @@ func (c *Client) GetCentrality(ctx context.Context) (map[string]domain.Centralit
 			BlastRadius:      it.BlastRadius,
 			DownstreamCount:  it.DownstreamCount,
 			ErrorPropagation: it.ErrorPropagation,
+			PodCount:         it.PodCount,
+			Availability:     it.Availability,
 			UpdatedAt:        now,
 		}
 	}
