@@ -22,6 +22,9 @@ type Config struct {
 	WebhookTargets []string
 	WebhookSecret  []byte
 
+	// Slack incoming webhook
+	SlackWebhookURL string
+
 	// Optional: Service catalog enrichment for webhooks
 	ClusterName string // CLUSTER_NAME
 	Region      string // REGION
@@ -46,6 +49,8 @@ func Load() (Config, error) {
 		c.WebhookTargets = strings.Split(targets, ",")
 	}
 	c.WebhookSecret = []byte(getEnv("WEBHOOK_SECRET", ""))
+
+	c.SlackWebhookURL = getEnv("SLACK_WEBHOOK_URL", "")
 
 	// Optional enrichment fields for webhooks
 	c.ClusterName = getEnv("CLUSTER_NAME", "LIONS-DEN")

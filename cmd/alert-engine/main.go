@@ -7,6 +7,7 @@ import (
 	"graph-alert-engine/internal/adapters/forecasting"
 	"graph-alert-engine/internal/adapters/graphservice"
 	api "graph-alert-engine/internal/adapters/http"
+	"graph-alert-engine/internal/adapters/slack"
 	"graph-alert-engine/internal/adapters/webhooks"
 	"graph-alert-engine/internal/core/domain"
 	"graph-alert-engine/internal/core/ports"
@@ -65,6 +66,14 @@ func main() {
 	wh := webhooks.NewOutbound(bus, cfg.WebhookTargets, cfg.WebhookSecret)
 	stopWH := wh.Start(ctx)
 	defer stopWH()
+
+	// Slack notifications
+	if cfg.SlackWebhookURL != "" {
+		slackNotifier := slack.New(logger, bus, cfg.SlackWebhookURL)
+		stopSlack := slackNotifier.Start(ctx)
+		defer stopSlack()
+		logger.Info("slack notifier enabled")
+	}
 
 	// Telemetry simulator (replace with K8s informer later)
 	go simulateTelemetry(ctx, bus)
