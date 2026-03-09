@@ -26,10 +26,9 @@ spec:
               value: "80.0"
             - name: SLACK_WEBHOOK_URL
               valueFrom:
-                secretKeyRef:
-                  name: alert-engine-secrets
+                configMapKeyRef:
+                  name: graph-alert-engine-runtime
                   key: slack-webhook-url
-                  optional: true
           readinessProbe:
             httpGet:
               path: /readyz

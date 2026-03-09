@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"graph-alert-engine/config"
 	"graph-alert-engine/internal/adapters/eventbus"
 	"graph-alert-engine/internal/adapters/forecasting"
@@ -32,6 +33,7 @@ func main() {
 		logger.Error("config error", "error", err)
 		os.Exit(1)
 	}
+	config.Init(cfg)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -91,6 +93,23 @@ func main() {
 		// Check dependencies? For now just ok.
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ready"))
+	})
+
+	// Runtime config reload endpoint
+	mux.HandleFunc("POST /admin/reload-config", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Env map[string]string `json:"env"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := config.ReloadWithOverrides("/etc/runtime-config/runtime.env", body.Env); err != nil {
+			logger.Error("config reload failed", "error", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"status": "error", "message": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "reloaded"})
 	})
 
 	// Register API Routes
