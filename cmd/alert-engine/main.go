@@ -69,13 +69,12 @@ func main() {
 	stopWH := wh.Start(ctx)
 	defer stopWH()
 
-	// Slack notifications
-	if cfg.SlackWebhookURL != "" {
-		slackNotifier := slack.New(logger, bus, cfg.SlackWebhookURL)
-		stopSlack := slackNotifier.Start(ctx)
-		defer stopSlack()
-		logger.Info("slack notifier enabled")
-	}
+	// Slack notifications (always created — reads URL from config at send time;
+	// if SLACK_WEBHOOK_URL is empty, alerts are silently skipped)
+	slackNotifier := slack.New(logger, bus)
+	stopSlack := slackNotifier.Start(ctx)
+	defer stopSlack()
+	logger.Info("slack notifier registered")
 
 	// Telemetry simulator (replace with K8s informer later)
 	go simulateTelemetry(ctx, bus)

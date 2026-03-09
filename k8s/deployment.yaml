@@ -24,11 +24,6 @@ spec:
               value: "http://graph-service:80"
             - name: RISK_THRESHOLD
               value: "80.0"
-            - name: SLACK_WEBHOOK_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: graph-alert-engine-runtime
-                  key: slack-webhook-url
           readinessProbe:
             httpGet:
               path: /readyz
