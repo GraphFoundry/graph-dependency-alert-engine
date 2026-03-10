@@ -684,7 +684,7 @@ func (r *RiskService) checkServiceAvailability(ctx context.Context) {
 		podCount := svc.PodCount
 		availability := svc.Availability
 
-		if podCount == 0 {
+		if podCount == 0 && availability < 0.8 {
 			degraded = append(degraded, degradedServiceInfo{svc, "service has 0 pods running", domain.SeverityCritical, podCount, availability})
 		} else if availability < 0.5 {
 			degraded = append(degraded, degradedServiceInfo{svc, fmt.Sprintf("service availability critically low: %.1f%%", availability*100), domain.SeverityCritical, podCount, availability})
