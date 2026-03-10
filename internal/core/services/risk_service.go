@@ -7,6 +7,7 @@ import (
 	"graph-alert-engine/internal/core/ports"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,12 +44,16 @@ type RiskService struct {
 	offlineActive   map[string]bool
 	offlineCooldown map[string]time.Time
 	recoveryTracker map[string]int
-	availabilityDegraded     map[string]bool
-	availabilityDegradedTime map[string]time.Time
+	availabilityDegraded      map[string]bool
+	availabilityDegradedTime  map[string]time.Time
+	availabilityPendingCount  map[string]int  // consecutive degraded checks for confirmation
+	clusterAlertActive        bool            // cluster-wide outage alert already sent
+	clusterAlertTime          time.Time       // when cluster alert was sent
 	seenByName      map[string]bool
 	lastSeenByName  map[string]time.Time
 	knownByName     map[string]domain.ServiceNode
 	allowedNS       map[string]struct{}
+	alertNS         map[string]struct{} // namespaces that generate availability alerts
 
 	servicePollInterval time.Duration
 	livenessInterval    time.Duration
@@ -61,7 +66,11 @@ type scoreRecord struct {
 	Score     float64
 }
 
-func NewRiskService(logger *slog.Logger, bus ports.EventBus, graph ports.GraphProvider, forecaster ports.Forecaster, clock ports.Clock, w Weights, threshold float64) *RiskService {
+func NewRiskService(logger *slog.Logger, bus ports.EventBus, graph ports.GraphProvider, forecaster ports.Forecaster, clock ports.Clock, w Weights, threshold float64, alertNamespaces []string) *RiskService {
+	ans := make(map[string]struct{}, len(alertNamespaces))
+	for _, ns := range alertNamespaces {
+		ans[ns] = struct{}{}
+	}
 	return &RiskService{
 		logger:              logger,
 		bus:                 bus,
@@ -85,10 +94,12 @@ func NewRiskService(logger *slog.Logger, bus ports.EventBus, graph ports.GraphPr
 		recoveryTracker:          make(map[string]int),
 		availabilityDegraded:     make(map[string]bool),
 		availabilityDegradedTime: make(map[string]time.Time),
+		availabilityPendingCount: make(map[string]int),
 		seenByName:               make(map[string]bool),
 		lastSeenByName:      make(map[string]time.Time),
 		knownByName:         make(map[string]domain.ServiceNode),
 		allowedNS:           map[string]struct{}{"default": {}},
+		alertNS:             ans,
 		servicePollInterval: 30 * time.Second,
 		livenessInterval:    10 * time.Second,
 		livenessTimeout:     45 * time.Second,
@@ -622,9 +633,27 @@ func (r *RiskService) checkSilentServices(ctx context.Context) {
 	}
 }
 
-// checkServiceAvailability monitors service availability and podCount, generating alerts for down or degraded services
+// degradedServiceInfo holds classification data for a service detected as unhealthy.
+type degradedServiceInfo struct {
+	svc          domain.ServiceNode
+	reason       string
+	severity     domain.Severity
+	podCount     int
+	availability float64
+}
+
+// restoredServiceInfo holds data for a service that transitioned from degraded to healthy.
+type restoredServiceInfo struct {
+	svc          domain.ServiceNode
+	podCount     int
+	availability float64
+	degradedTime time.Time
+}
+
+// checkServiceAvailability monitors service availability and podCount, generating alerts for down or degraded services.
+// It performs cluster-wide correlation to avoid alert storms when many services fail simultaneously,
+// and applies a confirmation delay to filter transient false positives.
 func (r *RiskService) checkServiceAvailability(ctx context.Context) {
-	// Get latest services data which includes availability and podCount
 	services, err := r.graph.GetServices(ctx)
 	if err != nil {
 		r.logger.Debug("failed to fetch services for availability check", "error", err)
@@ -632,41 +661,116 @@ func (r *RiskService) checkServiceAvailability(ctx context.Context) {
 	}
 
 	now := r.clock.Now()
+	totalServices := len(services)
+	if totalServices == 0 {
+		return
+	}
+
+	// ── Phase 1: Classify every service as degraded or healthy ──
+	var degraded []degradedServiceInfo
+	var restored []restoredServiceInfo
 
 	for _, svc := range services {
+		// Only generate availability alerts for configured namespaces.
+		// Infrastructure services (istio-system, kube-system, etc.) are skipped
+		// unless explicitly included via ALERT_NAMESPACES.
+		if len(r.alertNS) > 0 {
+			if _, ok := r.alertNS[svc.Namespace]; !ok {
+				continue
+			}
+		}
+
 		svcID := svc.ID()
 		podCount := svc.PodCount
 		availability := svc.Availability
 
-		// Check if service is down (no pods running)
 		if podCount == 0 {
-			r.raiseAvailabilityAlert(ctx, svc, "service has 0 pods running", domain.SeverityCritical, podCount, availability, now)
-			continue
-		}
+			degraded = append(degraded, degradedServiceInfo{svc, "service has 0 pods running", domain.SeverityCritical, podCount, availability})
+		} else if availability < 0.5 {
+			degraded = append(degraded, degradedServiceInfo{svc, fmt.Sprintf("service availability critically low: %.1f%%", availability*100), domain.SeverityCritical, podCount, availability})
+		} else if availability < 0.8 {
+			degraded = append(degraded, degradedServiceInfo{svc, fmt.Sprintf("service availability degraded: %.1f%%", availability*100), domain.SeverityWarning, podCount, availability})
+		} else {
+			// Healthy – clean up tracking state and detect restorations
+			r.mu.Lock()
+			wasDegraded := r.availabilityDegraded[svcID]
+			degradedTime := r.availabilityDegradedTime[svcID]
+			delete(r.offlineActive, svcID)
+			delete(r.availabilityDegraded, svcID)
+			delete(r.availabilityDegradedTime, svcID)
+			delete(r.availabilityPendingCount, svcID)
+			r.mu.Unlock()
 
-		// Check if service availability is critically low (below 50%)
-		if availability < 0.5 {
-			r.raiseAvailabilityAlert(ctx, svc, fmt.Sprintf("service availability critically low: %.1f%%", availability*100), domain.SeverityCritical, podCount, availability, now)
-			continue
+			if wasDegraded {
+				restored = append(restored, restoredServiceInfo{svc, podCount, availability, degradedTime})
+			}
 		}
+	}
 
-		// Check if service availability is degraded (below 80%)
-		if availability < 0.8 {
-			r.raiseAvailabilityAlert(ctx, svc, fmt.Sprintf("service availability degraded: %.1f%%", availability*100), domain.SeverityWarning, podCount, availability, now)
-			continue
-		}
+	// ── Phase 2: Handle degraded services (with correlation) ──
+	degradedRatio := float64(len(degraded)) / float64(totalServices)
+	isClusterWide := degradedRatio > 0.5 && len(degraded) >= 5
 
-		// Service is healthy - check if it was previously degraded and raise restoration alert
+	if isClusterWide {
+		// Cluster-wide outage – send ONE grouped alert instead of N individual ones
 		r.mu.Lock()
-		wasDegraded := r.availabilityDegraded[svcID]
-		degradedTime := r.availabilityDegradedTime[svcID]
-		delete(r.offlineActive, svcID)
-		delete(r.availabilityDegraded, svcID)
-		delete(r.availabilityDegradedTime, svcID)
+		alreadySent := r.clusterAlertActive
 		r.mu.Unlock()
 
-		if wasDegraded {
-			r.raiseRestorationAlert(ctx, svc, podCount, availability, degradedTime, now)
+		if !alreadySent {
+			r.raiseGroupedAvailabilityAlert(ctx, degraded, totalServices, now)
+		}
+
+		// Track state for every affected service so individual alerts don't fire later
+		r.mu.Lock()
+		for _, d := range degraded {
+			sID := d.svc.ID()
+			r.offlineActive[sID] = true
+			r.offlineCooldown[sID] = now
+			if !r.availabilityDegraded[sID] {
+				r.availabilityDegradedTime[sID] = now
+			}
+			r.availabilityDegraded[sID] = true
+		}
+		r.mu.Unlock()
+	} else {
+		// Not cluster-wide – apply per-service confirmation delay then individual alerts
+		r.mu.Lock()
+		r.clusterAlertActive = false
+		r.mu.Unlock()
+
+		for _, d := range degraded {
+			sID := d.svc.ID()
+
+			// Require 3 consecutive degraded checks (~30 s) to confirm the issue is real
+			// and filter out transient false positives from graph service data blips.
+			r.mu.Lock()
+			r.availabilityPendingCount[sID]++
+			count := r.availabilityPendingCount[sID]
+			r.mu.Unlock()
+
+			if count >= 3 {
+				r.raiseAvailabilityAlert(ctx, d.svc, d.reason, d.severity, d.podCount, d.availability, now)
+			} else {
+				r.logger.Debug("availability issue pending confirmation", "service", sID, "check", count)
+			}
+		}
+	}
+
+	// ── Phase 3: Handle restorations (with correlation) ──
+	if len(restored) > 0 {
+		restoredRatio := float64(len(restored)) / float64(totalServices)
+		isClusterRestore := restoredRatio > 0.3 && len(restored) >= 5
+
+		if isClusterRestore {
+			r.raiseGroupedRestorationAlert(ctx, restored, totalServices, now)
+			r.mu.Lock()
+			r.clusterAlertActive = false
+			r.mu.Unlock()
+		} else {
+			for _, rs := range restored {
+				r.raiseRestorationAlert(ctx, rs.svc, rs.podCount, rs.availability, rs.degradedTime, now)
+			}
 		}
 	}
 }
@@ -793,6 +897,131 @@ func (r *RiskService) raiseRestorationAlert(ctx context.Context, svc domain.Serv
 	}
 
 	r.logger.Info("service restored to healthy state", "service", svcID, "pods", podCount, "availability", availability, "downtime", duration.Round(time.Second))
+}
+
+// raiseGroupedAvailabilityAlert sends a single consolidated alert when many services are degraded simultaneously,
+// preventing an alert storm that would overwhelm on-call engineers.
+func (r *RiskService) raiseGroupedAvailabilityAlert(ctx context.Context, degraded []degradedServiceInfo, totalServices int, now time.Time) {
+	criticalCount := 0
+	serviceNames := make([]string, 0, len(degraded))
+	for _, d := range degraded {
+		serviceNames = append(serviceNames, d.svc.ID())
+		if d.severity == domain.SeverityCritical {
+			criticalCount++
+		}
+	}
+
+	// Build a concise summary listing up to 10 service names
+	listedNames := serviceNames
+	if len(listedNames) > 10 {
+		listedNames = listedNames[:10]
+	}
+	suffix := ""
+	if len(serviceNames) > 10 {
+		suffix = fmt.Sprintf(" and %d more", len(serviceNames)-10)
+	}
+
+	explanation := fmt.Sprintf(
+		"Cluster-wide availability issue: %d/%d services affected (%d critical). Services: %s%s. Investigate cluster-level infrastructure (node health, networking, control plane).",
+		len(degraded), totalServices, criticalCount,
+		strings.Join(listedNames, ", "), suffix,
+	)
+
+	alert := domain.Alert{
+		Service:           domain.ServiceNode{Name: "cluster-wide", Namespace: "system"},
+		Severity:          domain.SeverityCritical,
+		RecommendedAction: domain.ActionObserve,
+		ImpactScope: map[string]int{
+			"affected_services": len(degraded),
+			"total_services":    totalServices,
+			"critical_count":    criticalCount,
+		},
+		AutoMitigatable: false,
+		CreatedAt:       now,
+		Explanation:     explanation,
+		Risk: domain.RiskScore{
+			Service:   domain.ServiceNode{Name: "cluster-wide", Namespace: "system"},
+			Score:     100,
+			Severity:  domain.SeverityCritical,
+			Timestamp: now,
+			Meta: domain.RiskMetadata{
+				ModelVersion:     "v2.0-hybrid",
+				ThresholdVersion: "2026-01-02",
+				CalculationID:    fmt.Sprintf("cluster-avail-%d", now.Unix()),
+			},
+		},
+	}
+
+	alert = enrichAlert(alert, domain.AlertTypeAvailabilityDegraded, []string{"CLUSTER_WIDE_OUTAGE"})
+
+	if err := r.bus.Publish(ctx, domain.TopicRiskAlertRaised, alert); err != nil {
+		r.logger.Error("failed to publish grouped availability alert", "error", err)
+		return
+	}
+
+	r.mu.Lock()
+	r.clusterAlertActive = true
+	r.clusterAlertTime = now
+	r.mu.Unlock()
+
+	r.logger.Warn("cluster-wide availability alert raised", "affected", len(degraded), "total", totalServices)
+}
+
+// raiseGroupedRestorationAlert sends a single consolidated alert when many services recover simultaneously.
+func (r *RiskService) raiseGroupedRestorationAlert(ctx context.Context, restored []restoredServiceInfo, totalServices int, now time.Time) {
+	serviceNames := make([]string, 0, len(restored))
+	for _, rs := range restored {
+		serviceNames = append(serviceNames, rs.svc.ID())
+	}
+
+	listedNames := serviceNames
+	if len(listedNames) > 10 {
+		listedNames = listedNames[:10]
+	}
+	suffix := ""
+	if len(serviceNames) > 10 {
+		suffix = fmt.Sprintf(" and %d more", len(serviceNames)-10)
+	}
+
+	explanation := fmt.Sprintf(
+		"Cluster-wide recovery: %d/%d services restored. Services: %s%s",
+		len(restored), totalServices,
+		strings.Join(listedNames, ", "), suffix,
+	)
+
+	alert := domain.Alert{
+		Service:           domain.ServiceNode{Name: "cluster-wide", Namespace: "system"},
+		Severity:          domain.SeverityInfo,
+		RecommendedAction: domain.ActionObserve,
+		ImpactScope: map[string]int{
+			"restored_services": len(restored),
+			"total_services":    totalServices,
+		},
+		AutoMitigatable: false,
+		CreatedAt:       now,
+		Explanation:     explanation,
+		Risk: domain.RiskScore{
+			Service:   domain.ServiceNode{Name: "cluster-wide", Namespace: "system"},
+			Score:     0,
+			Severity:  domain.SeverityInfo,
+			Timestamp: now,
+			Meta: domain.RiskMetadata{
+				ModelVersion:     "v2.0-hybrid",
+				ThresholdVersion: "2026-01-02",
+				CalculationID:    fmt.Sprintf("cluster-restore-%d", now.Unix()),
+			},
+		},
+	}
+
+	alert = enrichAlert(alert, domain.AlertTypeAvailabilityDegraded, []string{"CLUSTER_RESTORED"})
+	alert.State = domain.AlertStateResolved
+
+	if err := r.bus.Publish(ctx, domain.TopicRiskAlertRaised, alert); err != nil {
+		r.logger.Error("failed to publish grouped restoration alert", "error", err)
+		return
+	}
+
+	r.logger.Info("cluster-wide restoration alert raised", "restored", len(restored), "total", totalServices)
 }
 
 // calculateAvailabilityScore returns a risk score based on pod count and availability

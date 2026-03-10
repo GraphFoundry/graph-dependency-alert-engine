@@ -28,6 +28,9 @@ type Config struct {
 	// Dashboard URL for linking back from notifications
 	DashboardURL string
 
+	// Namespace scoping for availability alerts (empty = all namespaces)
+	AlertNamespaces []string
+
 	// Optional: Service catalog enrichment for webhooks
 	ClusterName string // CLUSTER_NAME
 	Region      string // REGION
@@ -55,6 +58,16 @@ func Load() (Config, error) {
 
 	c.SlackWebhookURL = getEnv("SLACK_WEBHOOK_URL", "")
 	c.DashboardURL = getEnv("DASHBOARD_URL", "")
+
+	// Namespace scoping: only generate availability alerts for these namespaces.
+	// Defaults to "default" so infrastructure namespaces don't produce noise.
+	nsRaw := getEnv("ALERT_NAMESPACES", "default")
+	for _, ns := range strings.Split(nsRaw, ",") {
+		ns = strings.TrimSpace(ns)
+		if ns != "" {
+			c.AlertNamespaces = append(c.AlertNamespaces, ns)
+		}
+	}
 
 	// Optional enrichment fields for webhooks
 	c.ClusterName = getEnv("CLUSTER_NAME", "LIONS-DEN")

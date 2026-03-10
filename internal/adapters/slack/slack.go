@@ -82,6 +82,13 @@ func (n *Notifier) send(ctx context.Context, alert domain.Alert) error {
 		return nil // Slack not configured — skip silently
 	}
 
+	// Filter out info-level alerts (restorations, etc.) to reduce noise.
+	// Only actionable warning/critical alerts are sent to Slack.
+	if alert.Severity == domain.SeverityInfo {
+		n.logger.Debug("skipping info-level slack notification", "service", alert.Service.Name)
+		return nil
+	}
+
 	p := buildPayload(alert)
 
 	body, err := json.Marshal(p)

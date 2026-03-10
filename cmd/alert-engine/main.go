@@ -60,6 +60,7 @@ func main() {
 		clock,
 		services.Weights{W1PageRank: cfg.RiskW1, W2Latency: cfg.RiskW2, W3Error: cfg.RiskW3},
 		cfg.RiskThreshold,
+		cfg.AlertNamespaces,
 	)
 
 	stopRisk := rs.Start(ctx)
