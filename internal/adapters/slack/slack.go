@@ -27,20 +27,32 @@ type Notifier struct {
 
 // slackPayload is the Slack incoming-webhook request body.
 type slackPayload struct {
-	Text   string       `json:"text"`             // Fallback plain-text
-	Blocks []slackBlock `json:"blocks,omitempty"` // Rich Block Kit UI
+	Text        string            `json:"text"`                  // Fallback plain-text
+	Attachments []slackAttachment `json:"attachments,omitempty"` // Rich attachment with color sidebar
+}
+
+type slackAttachment struct {
+	Color   string       `json:"color"`
+	Blocks  []slackBlock `json:"blocks"`
+	Fallback string      `json:"fallback,omitempty"`
 }
 
 type slackBlock struct {
-	Type     string      `json:"type"`
-	Text     *slackText  `json:"text,omitempty"`
-	Fields   []slackText `json:"fields,omitempty"`
-	Elements []slackText `json:"elements,omitempty"`
+	Type     string        `json:"type"`
+	Text     *slackText    `json:"text,omitempty"`
+	Fields   []slackText   `json:"fields,omitempty"`
+	Elements []interface{} `json:"elements,omitempty"`
 }
 
 type slackText struct {
 	Type string `json:"type"` // "mrkdwn" or "plain_text"
 	Text string `json:"text"`
+}
+
+type slackButton struct {
+	Type string    `json:"type"` // "button"
+	Text slackText `json:"text"`
+	URL  string    `json:"url"`
 }
 
 func New(logger *slog.Logger, bus ports.EventBus) *Notifier {
@@ -96,239 +108,183 @@ func (n *Notifier) send(ctx context.Context, alert domain.Alert) error {
 	return nil
 }
 
-// buildPayload creates a rich Slack Block Kit message from a domain alert.
+// buildPayload creates a professional Slack message using attachments for the
+// colored sidebar, compact field layout, and an action button.
 func buildPayload(alert domain.Alert) slackPayload {
-	sev := strings.ToUpper(string(alert.Severity))
-	icon := severityIcon(alert.Severity)
 	cfg := config.Get()
+	sev := strings.ToUpper(string(alert.Severity))
+	svcID := alert.Service.Name
+	if alert.Service.Namespace != "" {
+		svcID = alert.Service.Namespace + "/" + alert.Service.Name
+	}
 
-	headline := fmt.Sprintf("%s *[%s] %s/%s*",
-		icon, sev, alert.Service.Namespace, alert.Service.Name)
+	fallback := fmt.Sprintf("[%s] %s — %s", sev, svcID, alert.Explanation)
 
-	fallback := fmt.Sprintf("[%s] %s %s/%s — %s",
-		sev, string(alert.Type), alert.Service.Namespace, alert.Service.Name, alert.Explanation)
+	// ── Blocks inside the colored attachment ──
 
+	// Title line
+	title := fmt.Sprintf("*%s*", svcID)
 	blocks := []slackBlock{
-		// ── Header ──
-		{
-			Type: "header",
-			Text: &slackText{Type: "plain_text", Text: fmt.Sprintf("%s %s Alert — %s/%s",
-				icon, sev, alert.Service.Namespace, alert.Service.Name)},
-		},
-		// ── Classification ──
 		{
 			Type: "section",
-			Text: &slackText{Type: "mrkdwn", Text: fmt.Sprintf(
-				"%s\n\n*Type:* `%s`  •  *State:* `%s`  •  *Priority:* `%s`\n\n> %s",
-				headline,
-				string(alert.Type), string(alert.State),
-				priorityLabel(alert.Priority),
-				alert.Explanation,
-			)},
-		},
-		{Type: "divider"},
-		// ── Risk & Metrics ──
-		{
-			Type:   "section",
-			Fields: buildRiskFields(alert),
-		},
-		// ── Latency & Error Metrics ──
-		{
-			Type:   "section",
-			Fields: buildObservabilityFields(alert),
-		},
-		// ── Graph Topology ──
-		{
-			Type:   "section",
-			Fields: buildGraphFields(alert),
-		},
-		{Type: "divider"},
-		// ── Decision ──
-		{
-			Type: "section",
-			Text: &slackText{Type: "mrkdwn", Text: fmt.Sprintf(
-				"*:zap: Recommended Action:* `%s`\n*Auto-mitigatable:* %s",
-				string(alert.RecommendedAction), boolEmoji(alert.AutoMitigatable),
-			)},
+			Text: &slackText{Type: "mrkdwn", Text: title},
 		},
 	}
 
-	// ── Reason Codes ──
-	if len(alert.ReasonCodes) > 0 {
-		codes := make([]string, len(alert.ReasonCodes))
-		for i, c := range alert.ReasonCodes {
-			codes[i] = "`" + c + "`"
-		}
+	// Summary line
+	summary := alert.Explanation
+	if summary != "" {
 		blocks = append(blocks, slackBlock{
 			Type: "section",
-			Text: &slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Reason Codes:*  %s", strings.Join(codes, "  "))},
+			Text: &slackText{Type: "mrkdwn", Text: summary},
 		})
 	}
 
-	// ── Trend ──
-	if delta := alert.Risk.Trends.ScoreDelta1s; delta != 0 {
-		arrow := ":chart_with_upwards_trend:"
-		if delta < 0 {
-			arrow = ":chart_with_downwards_trend:"
-		}
-		blocks = append(blocks, slackBlock{
-			Type: "section",
-			Text: &slackText{Type: "mrkdwn", Text: fmt.Sprintf(
-				"%s *Trend:* Δ%+.1f/s  |  30s avg: %.1f  |  2m avg: %.1f",
-				arrow, delta, alert.Risk.Trends.ScoreAvg30s, alert.Risk.Trends.ScoreAvg2m,
-			)},
-		})
+	// Detail fields — compact two-column layout, only include meaningful data
+	fields := []slackText{}
+	fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Status:* %s", humanState(alert.State))})
+	fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Severity:* %s", sev)})
+	fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Type:* %s", humanAlertType(alert.Type))})
+	fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Priority:* %s", priorityLabel(alert.Priority))})
+
+	if alert.Risk.Score > 0 {
+		fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Risk Score:* %.0f / 100", alert.Risk.Score)})
+	}
+	if alert.Service.Availability > 0 {
+		fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Availability:* %.1f%%", alert.Service.Availability*100)})
 	}
 
-	// ── Footer Context ──
-	ctxParts := []string{
-		fmt.Sprintf("Cluster: %s", cfg.ClusterName),
-		fmt.Sprintf("Region: %s", cfg.Region),
-		fmt.Sprintf("Env: %s", cfg.Environment),
-		fmt.Sprintf("Alert at %s", alert.CreatedAt.UTC().Format(time.RFC3339)),
+	m := alert.Risk.Metrics
+	if m.LatencyP95 > 0 {
+		fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Latency P95:* %.0f ms", m.LatencyP95)})
 	}
-	if alert.Risk.Meta.CalculationID != "" {
-		ctxParts = append(ctxParts, fmt.Sprintf("CalcID: %s", alert.Risk.Meta.CalculationID))
+	if m.ErrorRate5m > 0 {
+		fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Error Rate:* %.2f%%", m.ErrorRate5m*100)})
 	}
+
+	if ds, ok := alert.ImpactScope["downstream_count"]; ok && ds > 0 {
+		fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Downstream:* %d services", ds)})
+	}
+
+	fields = append(fields, slackText{Type: "mrkdwn", Text: fmt.Sprintf("*Action:* %s", humanAction(alert.RecommendedAction))})
 
 	blocks = append(blocks, slackBlock{
+		Type:   "section",
+		Fields: fields,
+	})
+
+	// Reason codes as a single context line
+	if len(alert.ReasonCodes) > 0 {
+		blocks = append(blocks, slackBlock{
+			Type: "context",
+			Elements: []interface{}{
+				slackText{Type: "mrkdwn", Text: strings.Join(alert.ReasonCodes, "  ·  ")},
+			},
+		})
+	}
+
+	// Actions — View Alert button
+	dashboardURL := cfg.DashboardURL
+	if dashboardURL != "" {
+		alertPath := "/alerts"
+		if alert.DedupeKey != "" {
+			alertPath = fmt.Sprintf("/alerts/%s", alert.DedupeKey)
+		}
+		blocks = append(blocks, slackBlock{
+			Type: "actions",
+			Elements: []interface{}{
+				slackButton{
+					Type: "button",
+					Text: slackText{Type: "plain_text", Text: "View Alert"},
+					URL:  strings.TrimRight(dashboardURL, "/") + alertPath,
+				},
+			},
+		})
+	}
+
+	// Footer context
+	ctxParts := []string{cfg.ClusterName, cfg.Region, cfg.Environment}
+	ctxParts = append(ctxParts, alert.CreatedAt.UTC().Format(time.RFC3339))
+	blocks = append(blocks, slackBlock{
 		Type: "context",
-		Elements: []slackText{
-			{Type: "mrkdwn", Text: strings.Join(ctxParts, "  •  ")},
+		Elements: []interface{}{
+			slackText{Type: "mrkdwn", Text: strings.Join(ctxParts, "  ·  ")},
 		},
 	})
 
 	return slackPayload{
-		Text:   fallback,
-		Blocks: blocks,
+		Text: fallback,
+		Attachments: []slackAttachment{
+			{
+				Color:    severityColor(alert.Severity),
+				Blocks:   blocks,
+				Fallback: fallback,
+			},
+		},
 	}
 }
 
-func buildRiskFields(alert domain.Alert) []slackText {
-	scoreBar := scoreProgressBar(alert.Risk.Score)
-	fields := []slackText{
-		{Type: "mrkdwn", Text: fmt.Sprintf("*Risk Score:*\n%s  *%.1f* / 100", scoreBar, alert.Risk.Score)},
-		{Type: "mrkdwn", Text: fmt.Sprintf("*Severity:*\n%s %s",
-			severityIcon(alert.Severity), strings.ToUpper(string(alert.Severity)))},
-	}
-	return fields
-}
-
-func buildObservabilityFields(alert domain.Alert) []slackText {
-	m := alert.Risk.Metrics
-	fields := []slackText{}
-
-	if m.LatencyP95 > 0 || m.LatencyP99 > 0 {
-		fields = append(fields, slackText{
-			Type: "mrkdwn",
-			Text: fmt.Sprintf("*Latency:*\nP95: `%.1f ms`  P99: `%.1f ms`", m.LatencyP95, m.LatencyP99),
-		})
-	}
-
-	if m.ErrorRate1m > 0 || m.ErrorRate5m > 0 {
-		fields = append(fields, slackText{
-			Type: "mrkdwn",
-			Text: fmt.Sprintf("*Error Rate:*\n1m: `%.2f%%`  5m: `%.2f%%`", m.ErrorRate1m*100, m.ErrorRate5m*100),
-		})
-	}
-
-	if m.Throughput > 0 {
-		fields = append(fields, slackText{
-			Type: "mrkdwn",
-			Text: fmt.Sprintf("*Throughput:*\n`%.0f rps`", m.Throughput),
-		})
-	}
-
-	if alert.Service.Availability > 0 {
-		fields = append(fields, slackText{
-			Type: "mrkdwn",
-			Text: fmt.Sprintf("*Availability:*\n`%.2f%%`", alert.Service.Availability*100),
-		})
-	}
-
-	if len(fields) == 0 {
-		fields = append(fields, slackText{Type: "mrkdwn", Text: "_No observability metrics available_"})
-	}
-	return fields
-}
-
-func buildGraphFields(alert domain.Alert) []slackText {
-	m := alert.Risk.Metrics
-	fields := []slackText{}
-
-	if m.PageRank > 0 {
-		fields = append(fields, slackText{
-			Type: "mrkdwn",
-			Text: fmt.Sprintf("*PageRank:*\n`%.4f`", m.PageRank),
-		})
-	}
-
-	impact := []string{}
-	if ds, ok := alert.ImpactScope["downstream_count"]; ok && ds > 0 {
-		impact = append(impact, fmt.Sprintf("%d downstream", ds))
-	}
-	if us, ok := alert.ImpactScope["upstream_count"]; ok && us > 0 {
-		impact = append(impact, fmt.Sprintf("%d upstream", us))
-	}
-	if nb, ok := alert.ImpactScope["neighborhood"]; ok && nb > 0 {
-		impact = append(impact, fmt.Sprintf("%d neighborhood", nb))
-	}
-	if len(impact) > 0 {
-		fields = append(fields, slackText{
-			Type: "mrkdwn",
-			Text: fmt.Sprintf("*Blast Radius:*\n%s", strings.Join(impact, " • ")),
-		})
-	}
-
-	if alert.Risk.Meta.GraphStale {
-		fields = append(fields, slackText{
-			Type: "mrkdwn",
-			Text: ":warning: *Graph data is stale*",
-		})
-	}
-
-	if len(fields) == 0 {
-		fields = append(fields, slackText{Type: "mrkdwn", Text: "_No graph topology data_"})
-	}
-	return fields
-}
-
-func scoreProgressBar(score float64) string {
-	filled := int(score / 10)
-	if filled > 10 {
-		filled = 10
-	}
-	empty := 10 - filled
-	if score >= 80 {
-		return strings.Repeat(":red_square:", filled) + strings.Repeat(":white_large_square:", empty)
-	}
-	if score >= 50 {
-		return strings.Repeat(":orange_square:", filled) + strings.Repeat(":white_large_square:", empty)
-	}
-	return strings.Repeat(":large_green_square:", filled) + strings.Repeat(":white_large_square:", empty)
-}
-
-func severityIcon(s domain.Severity) string {
+func severityColor(s domain.Severity) string {
 	switch s {
 	case domain.SeverityCritical:
-		return ":red_circle:"
+		return "#E01E5A" // red
 	case domain.SeverityWarning:
-		return ":large_yellow_circle:"
+		return "#ECB22E" // amber
 	default:
-		return ":large_blue_circle:"
+		return "#2EB67D" // green/info
+	}
+}
+
+func humanState(s domain.AlertState) string {
+	switch s {
+	case domain.AlertStateFiring:
+		return "Firing"
+	case domain.AlertStateResolved:
+		return "Resolved"
+	case domain.AlertStateAcknowledged:
+		return "Acknowledged"
+	default:
+		return string(s)
+	}
+}
+
+func humanAlertType(t domain.AlertType) string {
+	switch t {
+	case domain.AlertTypeAvailabilityDegraded:
+		return "Availability Degraded"
+	case domain.AlertTypeErrorRateHigh:
+		return "Error Rate High"
+	case domain.AlertTypeLatencyHigh:
+		return "Latency High"
+	case domain.AlertTypeSingleReplica:
+		return "Single Replica"
+	case domain.AlertTypeGraphCentralityHigh:
+		return "High Centrality"
+	default:
+		return string(t)
+	}
+}
+
+func humanAction(a domain.MitigationAction) string {
+	switch a {
+	case domain.ActionThrottle:
+		return "Throttle"
+	case domain.ActionFailover:
+		return "Failover"
+	case domain.ActionObserve:
+		return "Observe"
+	case domain.ActionScaleUp:
+		return "Scale Up"
+	case domain.ActionDegrade:
+		return "Degrade"
+	default:
+		return string(a)
 	}
 }
 
 func priorityLabel(p string) string {
 	if p == "" {
-		return "unset"
+		return "—"
 	}
 	return p
-}
-
-func boolEmoji(v bool) string {
-	if v {
-		return ":white_check_mark: Yes"
-	}
-	return ":x: No"
 }
