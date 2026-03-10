@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -197,13 +198,26 @@ func buildPayload(alert domain.Alert) slackPayload {
 		if alert.DedupeKey != "" {
 			alertPath = fmt.Sprintf("/alerts/%s", alert.DedupeKey)
 		}
+		alertURL := strings.TrimRight(dashboardURL, "/") + alertPath
+		// Append namespace and service as query parameters so the
+		// dashboard can resolve context without a DedupeKey lookup.
+		qv := url.Values{}
+		if alert.Service.Namespace != "" {
+			qv.Set("namespace", alert.Service.Namespace)
+		}
+		if alert.Service.Name != "" {
+			qv.Set("service", alert.Service.Name)
+		}
+		if encoded := qv.Encode(); encoded != "" {
+			alertURL += "?" + encoded
+		}
 		blocks = append(blocks, slackBlock{
 			Type: "actions",
 			Elements: []interface{}{
 				slackButton{
 					Type: "button",
 					Text: slackText{Type: "plain_text", Text: "View Alert"},
-					URL:  strings.TrimRight(dashboardURL, "/") + alertPath,
+					URL:  alertURL,
 				},
 			},
 		})
