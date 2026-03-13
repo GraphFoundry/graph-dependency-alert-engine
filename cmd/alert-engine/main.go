@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"graph-alert-engine/config"
 	"graph-alert-engine/internal/adapters/eventbus"
 	"graph-alert-engine/internal/adapters/forecasting"
 	"graph-alert-engine/internal/adapters/graphservice"
 	api "graph-alert-engine/internal/adapters/http"
+	"graph-alert-engine/internal/adapters/slack"
 	"graph-alert-engine/internal/adapters/webhooks"
 	"graph-alert-engine/internal/core/domain"
 	"graph-alert-engine/internal/core/ports"
@@ -31,6 +33,7 @@ func main() {
 		logger.Error("config error", "error", err)
 		os.Exit(1)
 	}
+	config.Init(cfg)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -57,6 +60,7 @@ func main() {
 		clock,
 		services.Weights{W1PageRank: cfg.RiskW1, W2Latency: cfg.RiskW2, W3Error: cfg.RiskW3},
 		cfg.RiskThreshold,
+		cfg.AlertNamespaces,
 	)
 
 	stopRisk := rs.Start(ctx)
@@ -65,6 +69,13 @@ func main() {
 	wh := webhooks.NewOutbound(bus, cfg.WebhookTargets, cfg.WebhookSecret)
 	stopWH := wh.Start(ctx)
 	defer stopWH()
+
+	// Slack notifications (always created — reads URL from config at send time;
+	// if SLACK_WEBHOOK_URL is empty, alerts are silently skipped)
+	slackNotifier := slack.New(logger, bus)
+	stopSlack := slackNotifier.Start(ctx)
+	defer stopSlack()
+	logger.Info("slack notifier registered")
 
 	// Telemetry simulator (replace with K8s informer later)
 	go simulateTelemetry(ctx, bus)
@@ -82,6 +93,23 @@ func main() {
 		// Check dependencies? For now just ok.
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ready"))
+	})
+
+	// Runtime config reload endpoint
+	mux.HandleFunc("POST /admin/reload-config", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Env map[string]string `json:"env"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := config.ReloadWithOverrides("/etc/runtime-config/runtime.env", body.Env); err != nil {
+			logger.Error("config reload failed", "error", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"status": "error", "message": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "reloaded"})
 	})
 
 	// Register API Routes

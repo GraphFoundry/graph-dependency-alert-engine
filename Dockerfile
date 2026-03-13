@@ -15,6 +15,6 @@ WORKDIR /
 COPY --from=builder /alert-engine /alert-engine
 COPY --from=builder /app/config /config
 
-EXPOSE 8080
+EXPOSE 8002
 
 CMD ["/alert-engine"]
